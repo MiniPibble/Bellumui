@@ -1,0 +1,1252 @@
+--[[
+    BellumHub - UI ONLY
+    Same design and toggles as the full script, but no redeemer / riddle / helper
+    functions. Every toggle and button only changes its own look and writes a line
+    to the activity log. Hook your own code into the marked stub functions.
+    Credit: Deob by Crxkv
+    Stop : getgenv().BellumUIStop()
+--]]
+
+local cloneref = cloneref or function(o) return o end
+local function svc(name)
+    local ok, s = pcall(function() return game:GetService(name) end)
+    if not ok or not s then return nil end
+    local ok2, r = pcall(cloneref, s)
+    if ok2 and r then return r end
+    return s
+end
+
+local Players          = svc("Players")
+local UserInputService = svc("UserInputService")
+local TweenService     = svc("TweenService")
+local CoreGui          = svc("CoreGui")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if env.BellumUIStop then pcall(env.BellumUIStop) end
+
+-- settings (not saved to disk in this UI-only version)
+local cfg = {
+    sniper = true, autoSubmit = true, submitAfter = 3, retypeInvalid = false,
+    riddleSolver = true, redeemDelay = 0.05, menuScale = 1.00,
+}
+local function saveConfig() end
+
+local UI_NAME = "BellumHub_UI"
+local GUI
+local logRich, clearLog, setStatus, applyPowerVisual, bumpSolvedLabel
+local _solvedCount, _askedCount = 0, 0
+
+----------------------------------------------------------------
+-- STUBS: put your own code in these
+----------------------------------------------------------------
+local function clearCapture() end                      -- called when mode / power changes
+local function setHelperAutoBuy(state) end             -- AUTO BUY toggle
+local function setHelperAnchor(state) end              -- ANCHOR toggle
+local function setHelperAntiRagdoll(state) end         -- ANTI RAGDOLL toggle
+local function onManualRedeem(code) end                -- REDEEM button / Enter in code box
+local function onSolve(question) end                   -- SOLVE button / Enter in riddle box
+
+-- BELLUMHUB UI
+-- Obsidian + ember design. The launcher stays 570x66 and the menu stays 410x620.
+-- No image assets are used: the logo is a drawn monogram.
+local UI = {} -- groups cosmetic UI references to stay under Luau local-register limits
+local viewportConn
+
+local EMBER        = Color3.fromRGB(255, 150, 50)
+local EMBER_HOT    = Color3.fromRGB(255, 98, 56)
+local GOLD         = Color3.fromRGB(255, 198, 96)
+local OBSIDIAN     = Color3.fromRGB(10, 10, 13)
+local ACTIVE_GREEN = Color3.fromRGB(72, 226, 132)
+local WHITE        = Color3.fromRGB(255, 255, 255)
+
+local Theme = {
+    Card   = Color3.fromRGB(20, 20, 26),
+    CardHi = Color3.fromRGB(31, 31, 39),
+    Line   = Color3.fromRGB(44, 44, 55),
+    Input  = Color3.fromRGB(12, 12, 16),
+    Text   = Color3.fromRGB(244, 244, 248),
+    Dim    = Color3.fromRGB(128, 128, 146),
+    Off    = Color3.fromRGB(50, 50, 61),
+    Green  = ACTIVE_GREEN,
+    Red    = Color3.fromRGB(240, 84, 92),
+    Warn   = Color3.fromRGB(250, 204, 90),
+}
+
+-- kept under the old names so the rest of the script needs no changes
+local T = {
+    bg = OBSIDIAN, panel = Theme.Card, line = Theme.Line, accent = EMBER,
+    text = Theme.Text, sub = Theme.Dim, ok = Theme.Green, err = Theme.Red, warn = Theme.Warn,
+}
+
+local LOG = {
+    dim   = "rgb(128,128,146)",
+    white = "rgb(255,255,255)",
+    ok    = "rgb(72,226,132)",
+    err   = "rgb(240,84,92)",
+    warn  = "rgb(250,204,90)",
+    acc   = "rgb(255,150,50)",
+    cyan  = "rgb(255,255,255)",
+}
+
+-- primitives
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    for key, value in pairs(props or {}) do inst[key] = value end
+    if parent then inst.Parent = parent end
+    return inst
+end
+local function corner(o, r)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r); c.Parent = o; return c
+end
+local function stroke(o, col, th, tr)
+    local s = Instance.new("UIStroke")
+    s.Color = col or Theme.Line; s.Thickness = th or 1; s.Transparency = tr or 0
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Parent = o
+    return s
+end
+local function tw(o, p, t, style)
+    TweenService:Create(o, TweenInfo.new(t or 0.14, style or Enum.EasingStyle.Quint, Enum.EasingDirection.Out), p):Play()
+end
+local function label(parent, text, size, color, font, align)
+    return new("TextLabel", {
+        BackgroundTransparency = 1, BorderSizePixel = 0, Text = text, TextSize = size or 11,
+        TextColor3 = color or Theme.Text, Font = font or Enum.Font.GothamMedium,
+        TextXAlignment = align or Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+    }, parent)
+end
+
+-- click helper that behaves on both mouse and touch
+local function bindClick(button, callback)
+    local last = 0
+    local function fire()
+        if tick() - last < 0.16 then return end
+        last = tick()
+        callback()
+    end
+    button.Activated:Connect(fire)
+    button.MouseButton1Click:Connect(fire)
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then fire() end
+    end)
+end
+
+-- ember gradient fill (frame colour must be white so the gradient shows true)
+local function emberFill(inst, rotation)
+    inst.BackgroundColor3 = WHITE
+    return new("UIGradient", {
+        Color = ColorSequence.new{
+            ColorSequenceKeypoint.new(0, GOLD),
+            ColorSequenceKeypoint.new(1, EMBER_HOT),
+        },
+        Rotation = rotation or 0,
+    }, inst)
+end
+
+-- soft press feedback + optional hover colours
+local function pressable(btn, baseProps, hoverProps)
+    local scale = new("UIScale", { Scale = 1 }, btn)
+    btn.MouseEnter:Connect(function()
+        if hoverProps then tw(btn, hoverProps, 0.12) end
+    end)
+    btn.MouseLeave:Connect(function()
+        if baseProps then tw(btn, baseProps, 0.12) end
+        tw(scale, { Scale = 1 }, 0.1)
+    end)
+    btn.MouseButton1Down:Connect(function() tw(scale, { Scale = 0.96 }, 0.08) end)
+    btn.MouseButton1Up:Connect(function() tw(scale, { Scale = 1 }, 0.12) end)
+end
+
+-- a comet of light that circles a border
+local function spinStroke(s, seconds)
+    local g = new("UIGradient", {
+        Color = ColorSequence.new{
+            ColorSequenceKeypoint.new(0, GOLD),
+            ColorSequenceKeypoint.new(0.5, EMBER_HOT),
+            ColorSequenceKeypoint.new(1, GOLD),
+        },
+        Transparency = NumberSequence.new{
+            NumberSequenceKeypoint.new(0, 0),
+            NumberSequenceKeypoint.new(0.3, 0.88),
+            NumberSequenceKeypoint.new(0.7, 0.88),
+            NumberSequenceKeypoint.new(1, 0),
+        },
+        Rotation = 0,
+    }, s)
+    TweenService:Create(g, TweenInfo.new(seconds or 6, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1), { Rotation = 360 }):Play()
+    return g
+end
+
+-- pill switch. Pass onChange=nil to bind the click yourself.
+local function makeSwitch(parent, position, initial, onChange)
+    local track = new("TextButton", {
+        Size = UDim2.fromOffset(46, 26), Position = position,
+        BackgroundColor3 = initial and EMBER or Theme.Off,
+        BorderSizePixel = 0, AutoButtonColor = false, Active = true, Text = "",
+    }, parent)
+    corner(track, 99)
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(20, 20),
+        Position = initial and UDim2.new(1, -23, 0.5, -10) or UDim2.new(0, 3, 0.5, -10),
+        BackgroundColor3 = WHITE, BorderSizePixel = 0,
+    }, track)
+    corner(knob, 99)
+    local state = initial
+    local function render(value)
+        state = value
+        tw(track, { BackgroundColor3 = value and EMBER or Theme.Off }, 0.16)
+        tw(knob, { Position = value and UDim2.new(1, -23, 0.5, -10) or UDim2.new(0, 3, 0.5, -10) }, 0.16)
+    end
+    if onChange then
+        bindClick(track, function()
+            render(not state)
+            onChange(state)
+        end)
+    end
+    return render, track
+end
+
+-- screen gui + global scale
+pcall(function()
+    for _, name in ipairs({ UI_NAME, "CursedHub_CodeRedeemer", "KatanaHub", "HiddenUI", "skyr0wtf_CodeRedeemer", "Skyr0WtfUI", "ACECodeSniperUI", "AutoTypeCodesUI", "ACEPaste", "GuiznxRiddle" }) do
+        local old = playerGui:FindFirstChild(name)
+        if old then old:Destroy() end
+        local oldCore = CoreGui and CoreGui:FindFirstChild(name)
+        if oldCore then oldCore:Destroy() end
+    end
+end)
+
+GUI = new("ScreenGui", {
+    Name = UI_NAME,
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 9999999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+local Master = new("Frame", {
+    Name = "BellumHub_MasterFrame",
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Size = UDim2.new(1, 0, 1, 0),
+}, GUI)
+local GlobalScale = new("UIScale", { Name = "BellumHub_GlobalScale", Scale = 1 }, Master)
+
+----------------------------------------------------------------
+-- LAUNCHER  (570 x 66, unchanged size)
+----------------------------------------------------------------
+local Launcher = new("Frame", {
+    Name = "Launcher",
+    Size = UDim2.fromOffset(570, 66),
+    Position = UDim2.new(0.5, -285, 0, 16),
+    BackgroundColor3 = WHITE,
+    BackgroundTransparency = 0.02,
+    BorderSizePixel = 0,
+    Active = true,
+}, Master)
+corner(Launcher, 99)
+new("UIGradient", {
+    Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 24, 31)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(10, 10, 13)),
+    },
+    Rotation = 90,
+}, Launcher)
+UI.LauncherOutline = stroke(Launcher, EMBER, 1.5, 0)
+spinStroke(UI.LauncherOutline, 8)
+
+-- monogram tile
+UI.LauncherLogo = new("Frame", {
+    Size = UDim2.fromOffset(42, 42),
+    Position = UDim2.fromOffset(12, 12),
+    BorderSizePixel = 0,
+}, Launcher)
+corner(UI.LauncherLogo, 99)
+emberFill(UI.LauncherLogo, 45)
+UI.LogoLetter = label(UI.LauncherLogo, "B", 22, OBSIDIAN, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+UI.LogoLetter.Size = UDim2.fromScale(1, 1)
+
+UI.LauncherTitle = label(Launcher, "", 17, Theme.Text, Enum.Font.GothamBlack)
+UI.LauncherTitle.RichText = true
+UI.LauncherTitle.Text = '<font color="rgb(255,255,255)">BELLUM</font><font color="rgb(255,170,60)">HUB</font>'
+UI.LauncherTitle.Size = UDim2.fromOffset(140, 22)
+UI.LauncherTitle.Position = UDim2.fromOffset(64, 11)
+
+UI.LauncherCaption = label(Launcher, "REDEEMER  •  DEOB BY CRXKV", 8, Theme.Dim, Enum.Font.GothamBold)
+UI.LauncherCaption.Size = UDim2.fromOffset(142, 14)
+UI.LauncherCaption.Position = UDim2.fromOffset(65, 35)
+
+UI.LauncherDivider = new("Frame", {
+    Size = UDim2.fromOffset(1, 32),
+    Position = UDim2.fromOffset(210, 17),
+    BackgroundColor3 = Theme.Line,
+    BorderSizePixel = 0,
+}, Launcher)
+
+local RedeemerBtn = new("TextButton", {
+    Name = "CodeRedeemerToggle",
+    Size = UDim2.fromOffset(222, 42),
+    Position = UDim2.fromOffset(224, 12),
+    BackgroundColor3 = cfg.sniper and Color3.fromRGB(16, 44, 30) or Theme.Card,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Active = true,
+    Text = "",
+}, Launcher)
+corner(RedeemerBtn, 99)
+UI.RedeemerStroke = stroke(RedeemerBtn, cfg.sniper and ACTIVE_GREEN or Theme.Line, 1, 0.2)
+pressable(RedeemerBtn)
+
+UI.RedeemerDot = new("Frame", {
+    Size = UDim2.fromOffset(10, 10),
+    Position = UDim2.fromOffset(16, 16),
+    BackgroundColor3 = cfg.sniper and ACTIVE_GREEN or Theme.Off,
+    BorderSizePixel = 0,
+}, RedeemerBtn)
+corner(UI.RedeemerDot, 10)
+
+UI.RedeemerText = label(RedeemerBtn, "CODE REDEEMER", 11, Theme.Text, Enum.Font.GothamBold)
+UI.RedeemerText.Size = UDim2.new(1, -92, 1, 0)
+UI.RedeemerText.Position = UDim2.fromOffset(36, 0)
+
+local RedeemerState = label(RedeemerBtn, cfg.sniper and "ON" or "OFF", 11,
+    cfg.sniper and ACTIVE_GREEN or Theme.Dim, Enum.Font.GothamBlack, Enum.TextXAlignment.Right)
+RedeemerState.Size = UDim2.fromOffset(40, 42)
+RedeemerState.Position = UDim2.new(1, -54, 0, 0)
+
+local MenuBtn = new("TextButton", {
+    Name = "MenuButton",
+    Size = UDim2.fromOffset(108, 42),
+    Position = UDim2.new(1, -120, 0, 12),
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Active = true,
+    Text = "MENU",
+    TextSize = 12,
+    TextColor3 = OBSIDIAN,
+    Font = Enum.Font.GothamBlack,
+}, Launcher)
+corner(MenuBtn, 99)
+emberFill(MenuBtn, 0)
+pressable(MenuBtn)
+
+do
+local function recalculateScale()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local h = camera.ViewportSize.Y
+    local scale
+    if UserInputService.TouchEnabled then
+        scale = math.clamp(h / 1000, 0.52, 0.78)
+    else
+        scale = math.clamp(h / 800, 0.70, 1.0)
+    end
+    GlobalScale.Scale = scale
+    Master.Size = UDim2.new(1 / scale, 0, 1 / scale, 0)
+end
+local function setupCameraListener()
+    if viewportConn then pcall(function() viewportConn:Disconnect() end) end
+    local camera = workspace.CurrentCamera
+    if camera then
+        viewportConn = camera:GetPropertyChangedSignal("ViewportSize"):Connect(recalculateScale)
+    end
+    recalculateScale()
+end
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(setupCameraListener)
+task.spawn(setupCameraListener)
+end
+
+----------------------------------------------------------------
+-- MENU WINDOW  (410 x 620, unchanged size)
+----------------------------------------------------------------
+local WIN_W, WIN_H = 410, 620
+
+local Window = new("Frame", {
+    Name = "BellumHubRedeemerMenu",
+    Size = UDim2.fromOffset(WIN_W, WIN_H),
+    Position = UDim2.new(0.5, -205, 0, 82),
+    BackgroundColor3 = WHITE,
+    BackgroundTransparency = 0.03,
+    BorderSizePixel = 0,
+    Active = true,
+    ClipsDescendants = true,
+    Visible = false,
+}, Master)
+corner(Window, 20)
+new("UIGradient", {
+    Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 19, 25)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(8, 8, 11)),
+    },
+    Rotation = 90,
+}, Window)
+UI.WindowOutline = stroke(Window, EMBER, 1.5, 0)
+spinStroke(UI.WindowOutline, 7)
+local MenuScale = new("UIScale", { Name = "BellumMenuScale", Scale = cfg.menuScale }, Window)
+
+-- ambient ember glow behind the header
+UI.Glow = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 170),
+    BackgroundColor3 = EMBER,
+    BorderSizePixel = 0,
+    ZIndex = 1,
+}, Window)
+corner(UI.Glow, 20)
+new("UIGradient", {
+    Transparency = NumberSequence.new{
+        NumberSequenceKeypoint.new(0, 0.82),
+        NumberSequenceKeypoint.new(1, 1),
+    },
+    Rotation = 90,
+}, UI.Glow)
+
+-- header
+UI.Header = new("Frame", {
+    Name = "Header",
+    Size = UDim2.new(1, 0, 0, 70),
+    BackgroundTransparency = 1,
+    Active = true,
+    ZIndex = 3,
+}, Window)
+
+UI.HeaderLogo = new("Frame", {
+    Size = UDim2.fromOffset(44, 44),
+    Position = UDim2.fromOffset(16, 14),
+    BorderSizePixel = 0,
+    ZIndex = 3,
+}, UI.Header)
+corner(UI.HeaderLogo, 14)
+emberFill(UI.HeaderLogo, 45)
+UI.HeaderLetter = label(UI.HeaderLogo, "B", 24, OBSIDIAN, Enum.Font.GothamBlack, Enum.TextXAlignment.Center)
+UI.HeaderLetter.Size = UDim2.fromScale(1, 1)
+UI.HeaderLetter.ZIndex = 4
+
+UI.Brand = label(UI.Header, "", 19, Theme.Text, Enum.Font.GothamBlack)
+UI.Brand.RichText = true
+UI.Brand.Text = '<font color="rgb(255,255,255)">BELLUM</font><font color="rgb(255,170,60)">HUB</font>'
+UI.Brand.Size = UDim2.fromOffset(180, 24)
+UI.Brand.Position = UDim2.fromOffset(72, 14)
+UI.Brand.ZIndex = 3
+
+UI.LiveDot = new("Frame", {
+    Size = UDim2.fromOffset(7, 7),
+    Position = UDim2.fromOffset(73, 45),
+    BackgroundColor3 = Theme.Off,
+    BorderSizePixel = 0,
+    ZIndex = 3,
+}, UI.Header)
+corner(UI.LiveDot, 4)
+TweenService:Create(UI.LiveDot, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+    { BackgroundTransparency = 0.65 }):Play()
+
+UI.SubTitle = label(UI.Header, "CODE REDEEMER  •  LISTENING", 9, Theme.Dim, Enum.Font.GothamBold)
+UI.SubTitle.Size = UDim2.fromOffset(200, 14)
+UI.SubTitle.Position = UDim2.fromOffset(86, 41)
+UI.SubTitle.ZIndex = 3
+
+-- close button
+UI.CloseBtn = new("TextButton", {
+    Size = UDim2.fromOffset(28, 28),
+    Position = UDim2.new(1, -44, 0, 21),
+    BackgroundColor3 = Theme.Card,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Active = true,
+    Text = "×",
+    TextSize = 18,
+    TextColor3 = Theme.Dim,
+    Font = Enum.Font.GothamBold,
+    ZIndex = 3,
+}, UI.Header)
+corner(UI.CloseBtn, 9)
+stroke(UI.CloseBtn, Theme.Line, 1, 0.2)
+pressable(UI.CloseBtn, { BackgroundColor3 = Theme.Card, TextColor3 = Theme.Dim },
+    { BackgroundColor3 = Theme.CardHi, TextColor3 = Theme.Text })
+
+-- master power switch
+local PowerRender, Power = makeSwitch(UI.Header, UDim2.new(1, -102, 0, 22), cfg.sniper, nil)
+Power.Name = "Power"
+Power.ZIndex = 3
+UI.PowerDot = Power:FindFirstChildOfClass("Frame")
+UI.PowerDot.ZIndex = 4
+
+UI.HeaderDivider = new("Frame", {
+    Size = UDim2.new(1, -32, 0, 1),
+    Position = UDim2.new(0, 16, 0, 70),
+    BackgroundColor3 = EMBER,
+    BorderSizePixel = 0,
+    ZIndex = 3,
+}, Window)
+new("UIGradient", {
+    Transparency = NumberSequence.new{
+        NumberSequenceKeypoint.new(0, 1),
+        NumberSequenceKeypoint.new(0.5, 0.35),
+        NumberSequenceKeypoint.new(1, 1),
+    },
+}, UI.HeaderDivider)
+
+-- segmented tab bar with a sliding indicator
+UI.TabBar = new("Frame", {
+    Name = "Tabs",
+    Size = UDim2.new(1, -32, 0, 38),
+    Position = UDim2.fromOffset(16, 82),
+    BackgroundColor3 = Theme.Card,
+    BorderSizePixel = 0,
+    ZIndex = 4,
+}, Window)
+corner(UI.TabBar, 12)
+stroke(UI.TabBar, Theme.Line, 1, 0.2)
+
+UI.TabIndicator = new("Frame", {
+    Size = UDim2.new(0.5, -4, 1, -8),
+    Position = UDim2.fromOffset(4, 4),
+    BorderSizePixel = 0,
+    ZIndex = 5,
+}, UI.TabBar)
+corner(UI.TabIndicator, 9)
+emberFill(UI.TabIndicator, 0)
+
+local function createTab(text, position)
+    return new("TextButton", {
+        Size = UDim2.new(0.5, 0, 1, 0),
+        Position = position,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Active = true,
+        Text = text,
+        TextColor3 = Theme.Dim,
+        TextSize = 11,
+        Font = Enum.Font.GothamBlack,
+        ZIndex = 6,
+    }, UI.TabBar)
+end
+UI.MainTab = createTab("MAIN", UDim2.fromOffset(0, 0))
+UI.HelperTab = createTab("HELPER", UDim2.new(0.5, 0, 0, 0))
+
+-- footer
+UI.Footer = label(Window, "BELLUMHUB  •  DEOB BY CRXKV", 9, Theme.Dim, Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+UI.Footer.Size = UDim2.new(1, -32, 0, 18)
+UI.Footer.Position = UDim2.new(0, 16, 1, -24)
+UI.Footer.ZIndex = 4
+
+----------------------------------------------------------------
+-- MAIN PAGE
+----------------------------------------------------------------
+local Body = new("Frame", {
+    Name = "MainPage",
+    Size = UDim2.new(1, -32, 1, -158),
+    Position = UDim2.fromOffset(16, 130),
+    BackgroundTransparency = 1,
+    ZIndex = 3,
+}, Window)
+
+local function makeFeatureCard(position, titleText, noteText, initial, onChange)
+    local card = new("Frame", {
+        Size = UDim2.new(0.5, -4, 0, 78),
+        Position = position,
+        BackgroundColor3 = Theme.Card,
+        BorderSizePixel = 0,
+    }, Body)
+    corner(card, 14)
+    local cardStroke = stroke(card, initial and EMBER or Theme.Line, 1, initial and 0.45 or 0.2)
+
+    local title = label(card, titleText, 11, Theme.Text, Enum.Font.GothamBold)
+    title.Size = UDim2.new(1, -28, 0, 16)
+    title.Position = UDim2.fromOffset(14, 12)
+    local note = label(card, noteText, 9, Theme.Dim, Enum.Font.GothamMedium)
+    note.Size = UDim2.new(1, -28, 0, 14)
+    note.Position = UDim2.fromOffset(14, 29)
+
+    local stateLabel = label(card, initial and "ON" or "OFF", 10, initial and EMBER or Theme.Dim,
+        Enum.Font.GothamBlack, Enum.TextXAlignment.Right)
+    stateLabel.Size = UDim2.fromOffset(40, 26)
+    stateLabel.Position = UDim2.new(1, -54, 0, 46)
+
+    local function paint(value)
+        tw(cardStroke, { Color = value and EMBER or Theme.Line, Transparency = value and 0.45 or 0.2 }, 0.15)
+        stateLabel.Text = value and "ON" or "OFF"
+        stateLabel.TextColor3 = value and EMBER or Theme.Dim
+    end
+    local renderSwitch = makeSwitch(card, UDim2.fromOffset(14, 46), initial, function(state)
+        paint(state)
+        onChange(state)
+    end)
+    return function(value) renderSwitch(value); paint(value) end
+end
+
+makeFeatureCard(UDim2.fromOffset(0, 0), "AUTO SUBMIT", "send at mode limit", cfg.autoSubmit, function(state)
+    cfg.autoSubmit = state
+    saveConfig()
+    logRich('<font color="' .. LOG.dim .. '">auto submit </font><font color="'
+        .. (state and LOG.ok or LOG.err) .. '">' .. (state and "on" or "off") .. "</font>")
+end)
+
+makeFeatureCard(UDim2.new(0.5, 4, 0, 0), "RIDDLE SOLVER", "AI + local fallback", cfg.riddleSolver, function(state)
+    cfg.riddleSolver = state
+    saveConfig()
+    logRich('<font color="' .. LOG.dim .. '">riddle solver </font><font color="'
+        .. (state and LOG.ok or LOG.err) .. '">' .. (state and "on" or "off") .. "</font>")
+end)
+
+-- redeem mode: 5 chips, 1..5 fragments
+do
+    local holder = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 64),
+        Position = UDim2.fromOffset(0, 86),
+        BackgroundColor3 = Theme.Card,
+        BorderSizePixel = 0,
+    }, Body)
+    corner(holder, 14)
+    stroke(holder, Theme.Line, 1, 0.2)
+
+    local modeTitle = label(holder, "REDEEM MODE", 11, Theme.Text, Enum.Font.GothamBold)
+    modeTitle.Size = UDim2.fromOffset(160, 16)
+    modeTitle.Position = UDim2.fromOffset(14, 14)
+    local modeNote = label(holder, "fragments before submit", 9, Theme.Dim, Enum.Font.GothamMedium)
+    modeNote.Size = UDim2.fromOffset(160, 14)
+    modeNote.Position = UDim2.fromOffset(14, 32)
+
+    local strip = new("Frame", {
+        Size = UDim2.fromOffset(166, 30),
+        Position = UDim2.new(1, -180, 0.5, -15),
+        BackgroundTransparency = 1,
+    }, holder)
+
+    local chips = {}
+    local function paintChips()
+        for i, chip in ipairs(chips) do
+            local active = (i == cfg.submitAfter)
+            tw(chip, { BackgroundColor3 = active and WHITE or Theme.CardHi }, 0.14)
+            chip.TextColor3 = active and OBSIDIAN or Theme.Dim
+            local g = chip:FindFirstChildOfClass("UIGradient")
+            if g then g.Enabled = active end
+        end
+    end
+
+    for i = 1, 5 do
+        local chip = new("TextButton", {
+            Size = UDim2.fromOffset(30, 30),
+            Position = UDim2.fromOffset((i - 1) * 34, 0),
+            BackgroundColor3 = Theme.CardHi,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Active = true,
+            Text = tostring(i),
+            TextSize = 13,
+            TextColor3 = Theme.Dim,
+            Font = Enum.Font.GothamBlack,
+        }, strip)
+        corner(chip, 9)
+        emberFill(chip, 0)
+        pressable(chip)
+        chips[i] = chip
+        bindClick(chip, function()
+            if cfg.submitAfter == i then return end
+            cfg.submitAfter = i
+            paintChips()
+            clearCapture()
+            saveConfig()
+            logRich('<font color="' .. LOG.dim .. '">mode: </font><font color="'
+                .. LOG.ok .. '">' .. i .. "/5</font>")
+        end)
+    end
+    paintChips()
+end
+
+-- auto retype invalid
+do
+    UI.RetypeRow = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 48),
+        Position = UDim2.fromOffset(0, 158),
+        BackgroundColor3 = Theme.Card,
+        BorderSizePixel = 0,
+    }, Body)
+    corner(UI.RetypeRow, 14)
+    UI.RetypeStroke = stroke(UI.RetypeRow, cfg.retypeInvalid and EMBER or Theme.Line, 1, cfg.retypeInvalid and 0.45 or 0.2)
+
+    UI.RetypeTitle = label(UI.RetypeRow, "AUTO RETYPE INVALID", 11, Theme.Text, Enum.Font.GothamBold)
+    UI.RetypeTitle.Size = UDim2.fromOffset(220, 16)
+    UI.RetypeTitle.Position = UDim2.fromOffset(14, 9)
+    local retypeNote = label(UI.RetypeRow, "try again when a code is rejected", 9, Theme.Dim, Enum.Font.GothamMedium)
+    retypeNote.Size = UDim2.fromOffset(220, 14)
+    retypeNote.Position = UDim2.fromOffset(14, 26)
+
+    local retypeRender, retypeSwitch = makeSwitch(UI.RetypeRow, UDim2.new(1, -60, 0.5, -13), cfg.retypeInvalid, nil)
+    UI.RetypeBtn = retypeSwitch
+    local retypeState = cfg.retypeInvalid
+    bindClick(UI.RetypeBtn, function()
+        retypeState = not retypeState
+        cfg.retypeInvalid = retypeState
+        saveConfig()
+        retypeRender(retypeState)
+        tw(UI.RetypeStroke, { Color = retypeState and EMBER or Theme.Line, Transparency = retypeState and 0.45 or 0.2 }, 0.15)
+        logRich('<font color="' .. LOG.dim .. '">retype invalid </font><font color="'
+            .. (retypeState and LOG.ok or LOG.err) .. '">' .. (retypeState and "on" or "off") .. "</font>")
+    end)
+end
+
+-- text-box styling helper (focus ring)
+local function styleInput(box, ringColor)
+    corner(box, 10)
+    local ring = stroke(box, Theme.Line, 1, 0.15)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 10) }, box)
+    box.Focused:Connect(function() tw(ring, { Color = ringColor, Transparency = 0.1 }, 0.14) end)
+    box.FocusLost:Connect(function() tw(ring, { Color = Theme.Line, Transparency = 0.15 }, 0.14) end)
+end
+
+-- manual code entry / live captured-code preview
+UI.CodeRow = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 34),
+    Position = UDim2.fromOffset(0, 214),
+    BackgroundTransparency = 1,
+}, Body)
+
+UI.CodeBox = new("TextBox", {
+    Name = "ManualCodeBox",
+    Size = UDim2.new(1, -96, 1, 0),
+    BackgroundColor3 = Theme.Input,
+    BorderSizePixel = 0,
+    ClearTextOnFocus = false,
+    Text = "",
+    PlaceholderText = "captured / type code...",
+    PlaceholderColor3 = Theme.Dim,
+    TextSize = 11,
+    Font = Enum.Font.GothamBold,
+    TextColor3 = Theme.Text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, UI.CodeRow)
+styleInput(UI.CodeBox, EMBER)
+
+UI.CodeRedeemBtn = new("TextButton", {
+    Name = "ManualRedeemButton",
+    Size = UDim2.fromOffset(88, 34),
+    Position = UDim2.new(1, -88, 0, 0),
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Active = true,
+    Text = "REDEEM",
+    TextSize = 11,
+    TextColor3 = OBSIDIAN,
+    Font = Enum.Font.GothamBlack,
+}, UI.CodeRow)
+corner(UI.CodeRedeemBtn, 10)
+emberFill(UI.CodeRedeemBtn, 0)
+pressable(UI.CodeRedeemBtn)
+
+-- AI / manual riddle tester
+UI.AskRow = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 34),
+    Position = UDim2.fromOffset(0, 256),
+    BackgroundTransparency = 1,
+    Visible = true,
+}, Body)
+
+UI.AskBox = new("TextBox", {
+    Size = UDim2.new(1, -96, 1, 0),
+    BackgroundColor3 = Theme.Input,
+    BorderSizePixel = 0,
+    ClearTextOnFocus = false,
+    Text = "",
+    PlaceholderText = "ask AI / test a riddle...",
+    PlaceholderColor3 = Theme.Dim,
+    TextSize = 11,
+    Font = Enum.Font.GothamMedium,
+    TextColor3 = Theme.Text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, UI.AskRow)
+styleInput(UI.AskBox, GOLD)
+
+UI.AskBtn = new("TextButton", {
+    Size = UDim2.fromOffset(88, 34),
+    Position = UDim2.new(1, -88, 0, 0),
+    BackgroundColor3 = Theme.CardHi,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Active = true,
+    Text = "SOLVE",
+    TextSize = 11,
+    TextColor3 = GOLD,
+    Font = Enum.Font.GothamBlack,
+}, UI.AskRow)
+corner(UI.AskBtn, 10)
+stroke(UI.AskBtn, EMBER, 1, 0.5)
+pressable(UI.AskBtn, { BackgroundColor3 = Theme.CardHi }, { BackgroundColor3 = Color3.fromRGB(44, 38, 34) })
+
+-- console
+UI.ConsoleBar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 18),
+    Position = UDim2.fromOffset(0, 300),
+    BackgroundTransparency = 1,
+}, Body)
+
+UI.ConsoleTitle = label(UI.ConsoleBar, "ACTIVITY LOG", 9, Theme.Dim, Enum.Font.GothamBlack)
+UI.ConsoleTitle.Size = UDim2.fromOffset(110, 18)
+UI.ConsoleTitle.Position = UDim2.fromOffset(4, 0)
+
+UI.SolvedLabel = label(UI.ConsoleBar, "0 solved / 0 asked", 9, GOLD, Enum.Font.GothamBold, Enum.TextXAlignment.Right)
+UI.SolvedLabel.Size = UDim2.fromOffset(150, 18)
+UI.SolvedLabel.Position = UDim2.new(1, -206, 0, 0)
+
+UI.ClearBtn = new("TextButton", {
+    Size = UDim2.fromOffset(46, 18),
+    Position = UDim2.new(1, -46, 0, 0),
+    BackgroundColor3 = Theme.CardHi,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+    Active = true,
+    Text = "CLEAR",
+    TextSize = 9,
+    TextColor3 = Theme.Text,
+    Font = Enum.Font.GothamBold,
+}, UI.ConsoleBar)
+corner(UI.ClearBtn, 6)
+pressable(UI.ClearBtn, { BackgroundColor3 = Theme.CardHi }, { BackgroundColor3 = Color3.fromRGB(46, 46, 56) })
+
+UI.Console = new("ScrollingFrame", {
+    Name = "Console",
+    Size = UDim2.new(1, 0, 1, -324),
+    Position = UDim2.fromOffset(0, 322),
+    BackgroundColor3 = Theme.Input,
+    BorderSizePixel = 0,
+    Active = true,
+    ClipsDescendants = true,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = EMBER,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.None,
+    ElasticBehavior = Enum.ElasticBehavior.WhenScrollable,
+}, Body)
+corner(UI.Console, 14)
+stroke(UI.Console, Theme.Line, 1, 0.2)
+
+local ConsoleText = new("TextLabel", {
+    Name = "Output",
+    Size = UDim2.new(1, -16, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    Position = UDim2.fromOffset(9, 7),
+    BackgroundTransparency = 1,
+    RichText = true,
+    Text = "",
+    TextSize = 11,
+    Font = Enum.Font.Code,
+    TextColor3 = Theme.Text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = true,
+}, UI.Console)
+
+----------------------------------------------------------------
+-- HELPER PAGE
+----------------------------------------------------------------
+UI.HelperPage = new("Frame", {
+    Name = "HelperPage",
+    Size = UDim2.new(1, -32, 1, -158),
+    Position = UDim2.fromOffset(16, 130),
+    BackgroundTransparency = 1,
+    Visible = false,
+    ZIndex = 3,
+}, Window)
+
+UI.HelperTitle = label(UI.HelperPage, "", 18, Theme.Text, Enum.Font.GothamBlack)
+UI.HelperTitle.RichText = true
+UI.HelperTitle.Text = '<font color="rgb(255,170,60)">AA</font><font color="rgb(255,255,255)"> HELPER</font>'
+UI.HelperTitle.Size = UDim2.new(1, 0, 0, 24)
+UI.HelperTitle.Position = UDim2.fromOffset(2, 0)
+UI.HelperSub = label(UI.HelperPage, "UTILITY CONTROLS", 9, Theme.Dim, Enum.Font.GothamBold)
+UI.HelperSub.Size = UDim2.new(1, 0, 0, 14)
+UI.HelperSub.Position = UDim2.fromOffset(3, 26)
+
+do
+local function makeValueControl(y, titleText, noteText, valueText)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 62),
+        Position = UDim2.fromOffset(0, y),
+        BackgroundColor3 = Theme.Card,
+        BorderSizePixel = 0,
+    }, UI.HelperPage)
+    corner(row, 14)
+    stroke(row, Theme.Line, 1, 0.2)
+    local title = label(row, titleText, 11, Theme.Text, Enum.Font.GothamBold)
+    title.Size = UDim2.fromOffset(150, 16)
+    title.Position = UDim2.fromOffset(14, 15)
+    local note = label(row, noteText, 9, Theme.Dim, Enum.Font.GothamMedium)
+    note.Size = UDim2.fromOffset(160, 14)
+    note.Position = UDim2.fromOffset(14, 33)
+
+    local control = new("Frame", {
+        Size = UDim2.fromOffset(154, 42),
+        Position = UDim2.new(1, -168, 0.5, -21),
+        BackgroundColor3 = Theme.Input,
+        BorderSizePixel = 0,
+    }, row)
+    corner(control, 12)
+    stroke(control, Theme.Line, 1, 0.15)
+
+    local function smallButton(text, x)
+        local button = new("TextButton", {
+            Size = UDim2.fromOffset(34, 34),
+            Position = UDim2.fromOffset(x, 4),
+            BackgroundColor3 = Theme.CardHi,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Active = true,
+            Text = text,
+            TextSize = 16,
+            TextColor3 = GOLD,
+            Font = Enum.Font.GothamBlack,
+        }, control)
+        corner(button, 9)
+        pressable(button, { BackgroundColor3 = Theme.CardHi }, { BackgroundColor3 = Color3.fromRGB(46, 46, 56) })
+        return button
+    end
+    local minus = smallButton("-", 4)
+    local plus = smallButton("+", 116)
+    local box = new("TextBox", {
+        Size = UDim2.fromOffset(74, 34),
+        Position = UDim2.fromOffset(40, 4),
+        BackgroundTransparency = 1,
+        ClearTextOnFocus = false,
+        Text = valueText,
+        TextColor3 = Theme.Text,
+        TextSize = 12,
+        Font = Enum.Font.GothamBlack,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    }, control)
+    return minus, plus, box
+end
+
+UI.DelayMinus, UI.DelayPlus, UI.DelayBox = makeValueControl(50, "REDEEM DELAY", "minimum 0.01 seconds", string.format("%.2f", cfg.redeemDelay))
+local function setRedeemDelay(value)
+    cfg.redeemDelay = math.clamp(math.floor((tonumber(value) or cfg.redeemDelay) * 100 + 0.5) / 100, 0.01, 3.00)
+    UI.DelayBox.Text = string.format("%.2f", cfg.redeemDelay)
+    saveConfig()
+end
+bindClick(UI.DelayMinus, function() setRedeemDelay(cfg.redeemDelay - 0.01) end)
+bindClick(UI.DelayPlus, function() setRedeemDelay(cfg.redeemDelay + 0.01) end)
+UI.DelayBox.FocusLost:Connect(function() setRedeemDelay(UI.DelayBox.Text) end)
+
+UI.SizeMinus, UI.SizePlus, UI.SizeBox = makeValueControl(120, "MENU SIZE", "scale the full redeemer", tostring(math.floor(cfg.menuScale * 100 + 0.5)) .. "%")
+local function setMenuScale(value)
+    local numeric = tonumber(tostring(value):gsub("%%", ""))
+    if numeric and numeric > 2 then numeric = numeric / 100 end
+    cfg.menuScale = math.clamp(numeric or cfg.menuScale, 0.70, 1.25)
+    cfg.menuScale = math.floor(cfg.menuScale * 20 + 0.5) / 20
+    UI.SizeBox.Text = tostring(math.floor(cfg.menuScale * 100 + 0.5)) .. "%"
+    tw(MenuScale, { Scale = cfg.menuScale }, 0.16)
+    saveConfig()
+end
+bindClick(UI.SizeMinus, function() setMenuScale(cfg.menuScale - 0.05) end)
+bindClick(UI.SizePlus, function() setMenuScale(cfg.menuScale + 0.05) end)
+UI.SizeBox.FocusLost:Connect(function() setMenuScale(UI.SizeBox.Text) end)
+
+local function makeHelperToggle(y, titleText, noteText, onChange)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 60),
+        Position = UDim2.fromOffset(0, y),
+        BackgroundColor3 = Theme.Card,
+        BorderSizePixel = 0,
+    }, UI.HelperPage)
+    corner(row, 14)
+    local rowStroke = stroke(row, Theme.Line, 1, 0.2)
+    local title = label(row, titleText, 12, Theme.Text, Enum.Font.GothamBlack)
+    title.Size = UDim2.fromOffset(190, 18)
+    title.Position = UDim2.fromOffset(14, 12)
+    local note = label(row, noteText, 9, Theme.Dim, Enum.Font.GothamMedium)
+    note.Size = UDim2.fromOffset(210, 14)
+    note.Position = UDim2.fromOffset(14, 31)
+    local _, button = makeSwitch(row, UDim2.new(1, -60, 0.5, -13), false, function(state)
+        tw(rowStroke, { Color = state and EMBER or Theme.Line, Transparency = state and 0.45 or 0.2 }, 0.15)
+        onChange(state)
+    end)
+    return button
+end
+
+makeHelperToggle(194, "AUTO BUY", "activate nearby prompts", function(s) setHelperAutoBuy(s); logRich("auto buy " .. (s and "on" or "off")) end)
+makeHelperToggle(264, "ANCHOR", "anchor your character", function(s) setHelperAnchor(s); logRich("anchor " .. (s and "on" or "off")) end)
+makeHelperToggle(334, "ANTI RAGDOLL", "force getting-up state", function(s) setHelperAntiRagdoll(s); logRich("anti ragdoll " .. (s and "on" or "off")) end)
+
+UI.HelperHint = label(UI.HelperPage, "HELPER SYSTEMS RUN ONLY WHILE ENABLED", 9, Theme.Dim,
+    Enum.Font.GothamBold, Enum.TextXAlignment.Center)
+UI.HelperHint.Size = UDim2.new(1, 0, 0, 18)
+UI.HelperHint.Position = UDim2.fromOffset(0, 408)
+end
+
+----------------------------------------------------------------
+-- TAB SWITCHING
+----------------------------------------------------------------
+local function showPage(name)
+    local helper = name == "HELPER"
+    Body.Visible = not helper
+    UI.HelperPage.Visible = helper
+    tw(UI.TabIndicator, { Position = helper and UDim2.new(0.5, 0, 0, 4) or UDim2.fromOffset(4, 4) }, 0.22)
+    UI.MainTab.TextColor3 = helper and Theme.Dim or OBSIDIAN
+    UI.HelperTab.TextColor3 = helper and OBSIDIAN or Theme.Dim
+end
+bindClick(UI.MainTab, function() showPage("MAIN") end)
+bindClick(UI.HelperTab, function() showPage("HELPER") end)
+showPage("MAIN")
+
+----------------------------------------------------------------
+-- CONSOLE WRITERS
+----------------------------------------------------------------
+do
+local logLines = {}
+local MAX_LOG = 160
+
+local function scrollToBottom()
+    task.defer(function()
+        task.wait()
+        if not UI.Console or not ConsoleText then return end
+        local height = ConsoleText.AbsoluteSize.Y + 14
+        UI.Console.CanvasSize = UDim2.new(0, 0, 0, height)
+        UI.Console.CanvasPosition = Vector2.new(0, math.max(0, height - UI.Console.AbsoluteSize.Y))
+    end)
+end
+ConsoleText:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+    UI.Console.CanvasSize = UDim2.new(0, 0, 0, ConsoleText.AbsoluteSize.Y + 14)
+end)
+
+logRich = function(line)
+    logLines[#logLines + 1] = line
+    if #logLines > MAX_LOG then table.remove(logLines, 1) end
+    ConsoleText.Text = table.concat(logLines, "\n")
+    scrollToBottom()
+end
+
+clearLog = function()
+    logLines = {}
+    ConsoleText.Text = '<font color="' .. LOG.dim .. '">cleared</font>'
+    UI.Console.CanvasPosition = Vector2.new(0, 0)
+end
+
+setStatus = function(msg, color)
+    logRich('<font color="' .. (color or LOG.dim) .. '">' .. tostring(msg) .. "</font>")
+end
+
+bumpSolvedLabel = function()
+    UI.SolvedLabel.Text = _solvedCount .. " solved / " .. _askedCount .. " asked"
+end
+
+bindClick(UI.ClearBtn, function()
+    clearLog()
+    _solvedCount, _askedCount = 0, 0
+    bumpSolvedLabel()
+end)
+
+----------------------------------------------------------------
+-- POWER VISUAL + LAUNCHER / MENU CONTROLS
+----------------------------------------------------------------
+applyPowerVisual = function()
+    local on = cfg.sniper
+    PowerRender(on)
+    tw(UI.LiveDot, { BackgroundColor3 = on and ACTIVE_GREEN or Theme.Off }, 0.12)
+    UI.SubTitle.Text = on and "CODE REDEEMER  •  LISTENING" or "CODE REDEEMER  •  PAUSED"
+    UI.SubTitle.TextColor3 = on and ACTIVE_GREEN or Theme.Dim
+    tw(RedeemerBtn, { BackgroundColor3 = on and Color3.fromRGB(16, 44, 30) or Theme.Card }, 0.12)
+    tw(UI.RedeemerDot, { BackgroundColor3 = on and ACTIVE_GREEN or Theme.Off }, 0.12)
+    tw(UI.RedeemerStroke, { Color = on and ACTIVE_GREEN or Theme.Line }, 0.12)
+    RedeemerState.Text = on and "ON" or "OFF"
+    RedeemerState.TextColor3 = on and ACTIVE_GREEN or Theme.Dim
+    tw(UI.WindowOutline, { Transparency = on and 0 or 0.6 }, 0.15)
+    tw(UI.LauncherOutline, { Transparency = on and 0 or 0.6 }, 0.15)
+end
+
+local function toggleSniper()
+    cfg.sniper = not cfg.sniper
+    saveConfig()
+    applyPowerVisual()
+    if cfg.sniper then
+        clearCapture()
+        logRich('<font color="' .. LOG.ok .. '">sniper on</font>')
+    else
+        logRich('<font color="' .. LOG.err .. '">sniper off</font>')
+    end
+end
+bindClick(Power, toggleSniper)
+bindClick(RedeemerBtn, toggleSniper)
+
+local menuOpen = false
+local function setMenuOpen(open)
+    menuOpen = open
+    if open then
+        Window.Visible = true
+        Window.Size = UDim2.fromOffset(WIN_W, 38)
+        tw(Window, { Size = UDim2.fromOffset(WIN_W, WIN_H) }, 0.2)
+        MenuBtn.Text = "CLOSE"
+    else
+        MenuBtn.Text = "MENU"
+        tw(Window, { Size = UDim2.fromOffset(WIN_W, 38) }, 0.14)
+        task.delay(0.15, function()
+            if not menuOpen then Window.Visible = false end
+        end)
+    end
+end
+bindClick(MenuBtn, function() setMenuOpen(not menuOpen) end)
+bindClick(UI.CloseBtn, function() setMenuOpen(false) end)
+end
+
+-- dragging (scale aware): menu by its header
+do
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+    local THRESHOLD = UserInputService.TouchEnabled and 8 or 2
+    local moved = false
+
+    local function overControl(position)
+        for _, control in ipairs({ Power, UI.CloseBtn }) do
+            local pos, size = control.AbsolutePosition, control.AbsoluteSize
+            if position.X >= pos.X - 8 and position.X <= pos.X + size.X + 8
+                and position.Y >= pos.Y - 8 and position.Y <= pos.Y + size.Y + 8 then
+                return true
+            end
+        end
+        return false
+    end
+
+    UI.Header.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if dragging or overControl(input.Position) then return end
+        dragging, dragInput = true, input
+        dragStart = Vector2.new(input.Position.X, input.Position.Y)
+        startPos = Window.Position
+        moved = false
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End
+                or input.UserInputState == Enum.UserInputState.Cancel then
+                if input == dragInput then dragging, dragInput = false, nil end
+            end
+        end)
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging or not dragInput then return end
+        local trackedTouch = dragInput.UserInputType == Enum.UserInputType.Touch and input == dragInput
+        local trackedMouse = dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement
+        if not trackedTouch and not trackedMouse then return end
+
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+        if not moved then
+            if delta.Magnitude < THRESHOLD then return end
+            moved = true
+        end
+        local scale = GlobalScale.Scale
+        if scale <= 0 then scale = 1 end
+        Window.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + (delta.X / scale),
+            startPos.Y.Scale, startPos.Y.Offset + (delta.Y / scale)
+        )
+    end)
+end
+
+-- the launcher is draggable from any empty spot
+do
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+    local moved = false
+    local THRESHOLD = UserInputService.TouchEnabled and 8 or 2
+
+    local function overLauncherControl(position)
+        for _, control in ipairs({ RedeemerBtn, MenuBtn }) do
+            local pos, size = control.AbsolutePosition, control.AbsoluteSize
+            if position.X >= pos.X - 6 and position.X <= pos.X + size.X + 6
+                and position.Y >= pos.Y - 6 and position.Y <= pos.Y + size.Y + 6 then
+                return true
+            end
+        end
+        return false
+    end
+
+    Launcher.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if dragging or overLauncherControl(input.Position) then return end
+        dragging, dragInput = true, input
+        dragStart = Vector2.new(input.Position.X, input.Position.Y)
+        startPos = Launcher.Position
+        moved = false
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End
+                or input.UserInputState == Enum.UserInputState.Cancel then
+                if input == dragInput then dragging, dragInput = false, nil end
+            end
+        end)
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging or not dragInput then return end
+        local trackedTouch = dragInput.UserInputType == Enum.UserInputType.Touch and input == dragInput
+        local trackedMouse = dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement
+        if not trackedTouch and not trackedMouse then return end
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+        if not moved and delta.Magnitude < THRESHOLD then return end
+        moved = true
+        local scale = math.max(GlobalScale.Scale, 0.01)
+        Launcher.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X / scale,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y / scale
+        )
+    end)
+end
+
+-- hide / show with RightControl
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.RightControl then
+        GUI.Enabled = not GUI.Enabled
+    end
+end)
+
+-- open animation: launcher drops in, menu rises
+do
+    local launcherTarget = Launcher.Position
+    Launcher.Position = UDim2.new(launcherTarget.X.Scale, launcherTarget.X.Offset, launcherTarget.Y.Scale, launcherTarget.Y.Offset - 30)
+    tw(Launcher, { Position = launcherTarget }, 0.35)
+
+    local target = Window.Position
+    MenuScale.Scale = cfg.menuScale * 0.94
+    Window.Position = UDim2.new(target.X.Scale, target.X.Offset, target.Y.Scale, target.Y.Offset + 18)
+    tw(MenuScale, { Scale = cfg.menuScale }, 0.20)
+    tw(Window, { Position = target }, 0.20)
+end
+
+applyPowerVisual()
+bumpSolvedLabel()
+logRich('<font color="' .. LOG.acc .. '">BELLUMHUB UI loaded</font>')
+logRich('<font color="' .. LOG.dim .. '">deob by Crxkv</font>')
+logRich('<font color="' .. LOG.dim .. '">UI only - no functions attached</font>')
+
+----------------------------------------------------------------
+-- BUTTON WIRING (UI only)
+----------------------------------------------------------------
+local function trim(s) return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", "")) end
+
+local function manualRedeem()
+    local code = trim(UI.CodeBox.Text)
+    if code == "" then setStatus("type a code first", LOG.warn) return end
+    onManualRedeem(code)
+    logRich('<font color="' .. LOG.dim .. '">redeem pressed: </font><font color="' .. LOG.ok .. '">' .. code .. "</font>")
+end
+bindClick(UI.CodeRedeemBtn, manualRedeem)
+UI.CodeBox.FocusLost:Connect(function(enter) if enter then manualRedeem() end end)
+
+local function solve()
+    local q = trim(UI.AskBox.Text)
+    if q == "" then setStatus("type a riddle first", LOG.warn) return end
+    UI.AskBox.Text = ""
+    _askedCount += 1
+    bumpSolvedLabel()
+    onSolve(q)
+    logRich('<font color="' .. LOG.dim .. '">solve pressed: </font><font color="' .. LOG.white .. '">' .. q .. "</font>")
+end
+bindClick(UI.AskBtn, solve)
+UI.AskBox.FocusLost:Connect(function(enter) if enter then solve() end end)
+
+env.BellumUIStop = function()
+    if viewportConn then pcall(function() viewportConn:Disconnect() end) end
+    if GUI then pcall(function() GUI:Destroy() end) end
+end
